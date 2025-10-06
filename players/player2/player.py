@@ -1,327 +1,353 @@
 from __future__ import annotations
-from typing import Optional
+from typing import List, Tuple, Optional
 from math import inf
+import time
 
 from shapely import Point, Polygon
-
 from players.player import Player, PlayerException
-import src.constants as c
 from src.cake import Cake
 
 
 class Player2(Player):
     """
-    Player2: Divide-&-Conquer Backtracking (beam search + pruning)
-    with greedy fill to guarantee exactly (children - 1) cuts.
+    Expanded-search equal-target player.
 
-    - Primary objective: equal areas per child.
-    - Secondary (soft): interior proportion closeness to cake average.
-    - Strategy:
-        1) Search: recursive split with preferred even/odd child counts; keep top-K cuts.
-        2) Fill: if search returns fewer than needed, iteratively split the largest
-           remaining piece with the best approximate equal-area cut until we have n-1 cuts.
+    Goal: every final piece area ≈ (area(cake)/children) within ±0.05 cm² when geometrically possible,
+    and interior ratio near the global target ratio as a soft tie-breaker.
+
+    Strategy per cut:
+      - Always split the CURRENT LARGEST PIECE.
+      - Run a dense boundary search to "peel" one target-sized piece:
+        * Uniformly sample many anchor points along the boundary.
+        * For each anchor, sweep the opposite endpoint densely around the boundary.
+        * Keep top K sweeps per anchor (lowest area error) and run adaptive local refinement
+          (bracket-shrink) to drive error down to the strict tolerance if possible.
+      - If strict target not achievable due to geometry/validity, take the closest by (area, ratio).
+      - Odd n: first make a 1/n vs (n-1)/n cut on the whole cake using the same search, then proceed.
+
+    A global time budget (TIME_BUDGET_SEC) caps total work; within it we bias toward precision.
     """
 
-    def __init__(self, children: int, cake: Cake, cake_path: str | None) -> None:
-        """
-        Initialize Player2 with the number of children, the cake object, and optional parameters.
-
-        Args:
-            children (int): Number of children to divide the cake for.
-            cake (Cake): The cake object to be divided.
-            cake_path (Optional[str]): Path to the cake file (if any).
-            beam_width (int): Number of top candidates to keep during beam search.
-            debug (bool): Whether to enable debug logging.
-        """
+    def __init__(
+        self,
+        children: int,
+        cake: Cake,
+        cake_path: Optional[str] = None,
+        debug: bool = False,
+    ) -> None:
         super().__init__(children, cake, cake_path)
+        self.debug = debug
 
-        # Calculate total area, target area per child, and average interior ratio
-        base_poly = self.cake.get_pieces()[0]
-        self.total_area = base_poly.area
-        self.target_area = self.total_area / children
-        self.avg_ratio = self.cake.interior_shape.area / self.total_area
-
-        self.beam_width = 5
-        self.debug = False
-
-        # Soft tolerances for area and ratio errors
-        self.area_tol = getattr(c, "PIECE_SPAN_TOL", 0.5)  # cm^2 if present
-        self.ratio_tol = 0.05
-
-    # ---------- public ----------
-    def get_cuts(self) -> list[tuple[Point, Point]]:
-        """
-        Generate the cuts required to divide the cake into `children` pieces.
-
-        Returns:
-            list[tuple[Point, Point]]: list of cuts as tuples of points.
-        """
-        # Work on a local copy of the cake
-        work = self.cake.copy()
-        root_piece = work.get_pieces()[0]
-
-        # Perform recursive search to generate a cutting plan
-        _, planned = self._search(
-            self._wrap_subcake(work, root_piece),
-            pieces_needed=self.children,
-            best_so_far=inf,
-            depth=0,
+        # Targets
+        self.total_area = self.cake.exterior_shape.area
+        self.target_area = self.total_area / max(1, self.children)
+        self.target_ratio = (
+            self.cake.interior_shape.area / self.cake.exterior_shape.area
+            if self.cake.exterior_shape.area > 0
+            else 0.0
         )
 
-        cuts: list[tuple[Point, Point]] = list(planned)
+        # Strict spec tolerances
+        self.strict_tol = 0.05  # cm^2
+        self.ratio_tol = 0.05  # 5% (soft, for tie-break only)
 
-        # If the plan is incomplete, use greedy filling to add remaining cuts
-        while len(cuts) < self.children - 1:
-            remaining_children = self.children - len(cuts)
-            best = self._best_greedy_cut_for(work, remaining_children)
-            if not best:
-                break  # No further valid cuts found
-            from_p, to_p = best
-            cuts.append((from_p, to_p))
-            work.cut(from_p, to_p)  # Update the working cake
+        # Dense search parameters (tuned for ~1 minute worst-case)
+        self.ANCHOR_SAMPLES = 120  # boundary anchors per search
+        self.SWEEP_SAMPLES = 720  # coarse sweep positions per anchor
+        self.TOP_SWEEPS_PER_ANCHOR = 4  # refine multiple best candidates per anchor
+        self.REFINE_ITERS = 6  # bracket-shrink iterations
+        self.REFINE_GRID = 21  # samples per refine iteration in [L,R]
 
-        # If still incomplete, use fallback random valid cuts
-        if len(cuts) != self.children - 1:
-            if self.debug:
-                print(f"[Player2] Had {len(cuts)} cuts; attempting any-valid fallback.")
-            if not self._fill_with_any_valid(work, cuts):
+        # Bisection-like shrink factor
+        self.REFINE_SHRINK = 0.35
+
+        # Validity guard for near-adjacent endpoints (normalized by boundary length)
+        self.MIN_SEP_FRAC = 1.0 / 600.0
+
+        # Time budget (wall clock) to approximate CPU minute
+        self.TIME_BUDGET_SEC = 55.0
+
+    # -------------------- public entry --------------------
+    def get_cuts(self) -> List[Tuple[Point, Point]]:
+        if self.children <= 1:
+            return []
+
+        start_time = time.time()
+        deadline = start_time + self.TIME_BUDGET_SEC
+
+        work = self.cake.copy()
+        cuts: List[Tuple[Point, Point]] = []
+
+        # Odd: first 1/n peel from the whole cake
+        if self.children % 2 == 1:
+            whole = self._largest_piece(work)
+            first = self._target_search(
+                work, whole, frac=1.0 / self.children, deadline=deadline
+            )
+            if first is None:
+                # fallback: any valid cut to proceed
+                first = self._any_valid_cut_on_piece(work, whole)
+            if first is None:
+                raise PlayerException("Player2: no valid first cut for odd strategy")
+            cuts.append(first)
+            work.cut(*first)
+
+        # Continue peeling target shares until n pieces exist
+        while len(work.get_pieces()) < self.children:
+            if time.time() > deadline:
+                # Time nearly up: be pragmatic
+                cut = self._best_equal_area_or_any(work)
+            else:
+                largest = self._largest_piece(work)
+                cut = self._target_search(
+                    work, largest, frac=None, deadline=deadline
+                )  # None => absolute target
+                if cut is None:
+                    # fallback if strict search fails
+                    cut = self._best_equal_area_or_any(work)
+
+            if cut is None:
                 raise PlayerException(
-                    f"Player2: could not assemble {self.children - 1} cuts (got {len(cuts)})."
+                    f"Player2: ran out of valid cuts at {len(work.get_pieces())} pieces"
                 )
+
+            cuts.append(cut)
+            work.cut(*cut)
+
+        if len(cuts) != self.children - 1:
+            raise PlayerException(
+                f"Player2: expected {self.children - 1} cuts, got {len(cuts)}"
+            )
 
         return cuts
 
-    # ---------- beam-search backtracking ----------
-    def _search(
+    # -------------------- main search --------------------
+    def _target_search(
         self,
         cake: Cake,
-        pieces_needed: int,
-        best_so_far: float,
-        depth: int,
-    ) -> tuple[float, list[tuple[Point, Point]]]:
+        piece: Polygon,
+        frac: Optional[float],
+        deadline: float,
+    ) -> Optional[Tuple[Point, Point]]:
         """
-        Perform recursive beam-search backtracking to find the best cuts.
-
-        Args:
-            cake (Cake): The current cake state.
-            pieces_needed (int): Number of pieces needed.
-            best_so_far (float): Best score found so far.
-            depth (int): Current recursion depth.
-
-        Returns:
-            tuple[float, list[tuple[Point, Point]]]: Best score and corresponding cuts.
+        Search a boundary-to-boundary chord to peel a target-sized area from `piece`.
+        If frac is None -> target = self.target_area, else target = frac * piece.area.
+        Returns a cut (Point, Point) or None if no valid chord found.
         """
-        piece = cake.get_pieces()[0]
-        piece_area = piece.area
+        bound = piece.boundary
+        L = bound.length
+        if L <= 0 or piece.area <= 0:
+            return None
 
-        if self.debug:
-            print(
-                f"{'  ' * depth}[search] depth={depth} need={pieces_needed} area={piece_area:.3f}"
-            )
+        target = (
+            self.target_area
+            if frac is None
+            else max(0.0, min(piece.area, frac * piece.area))
+        )
+        min_sep = self.MIN_SEP_FRAC
 
-        # Base case: if only one piece is needed, score the leaf
-        if pieces_needed == 1:
-            return self._leaf_score(cake), []
+        def pt(t: float) -> Point:
+            # normalized arclength -> boundary point
+            return bound.interpolate((t % 1.0) * L)
 
-        # Generate preferred and neighboring split counts
-        m = pieces_needed
-        preferred = [(m // 2, m - (m // 2))]
-        neighbors: list[tuple[int, int]] = []
-        if m > 2:
-            a0 = preferred[0][0]
-            neighbors.append((max(1, a0 - 1), m - max(1, a0 - 1)))
-            neighbors.append((min(m - 1, a0 + 1), m - min(m - 1, a0 + 1)))
-
-        splits: list[tuple[int, int]] = []
-        seen = set()
-        for a, b in preferred + neighbors:
-            if a <= 0 or b <= 0:
-                continue
-            key = (min(a, b), max(a, b))
-            if key not in seen:
-                splits.append((a, b))
-                seen.add(key)
-
-        # Generate candidate cuts based on perimeter vertices and edge midpoints
-        candidate_points = self._candidate_points(piece)
-
-        cand: list[
-            tuple[float, tuple[Point, Point], tuple[Polygon, Polygon], tuple[int, int]]
-        ] = []
-        for i in range(len(candidate_points)):
-            for j in range(i + 1, len(candidate_points)):
-                pA, pB = candidate_points[i], candidate_points[j]
-                ok, _ = cake.cut_is_valid(pA, pB)
-                if not ok:
-                    continue
-                split = cake.cut_piece(piece, pA, pB)
-                if len(split) != 2:
-                    continue
-                P, Q = split
-                aP, aQ = P.area, Q.area
-
-                for a, b in splits:
-                    tP = a * self.target_area
-                    tQ = b * self.target_area
-                    # Calculate error based on area and ratio
-                    err = (aP - tP) ** 2 + (aQ - tQ) ** 2
-                    rP = self._ratio_v_parent(cake, P)
-                    rQ = self._ratio_v_parent(cake, Q)
-                    err += 0.1 * (
-                        (rP - self.avg_ratio) ** 2 + (rQ - self.avg_ratio) ** 2
-                    )
-                    cand.append((err, (pA, pB), (P, Q), (a, b)))
-
-        if not cand:
-            return inf, []
-
-        # Keep the top-K candidates based on beam width
-        cand.sort(key=lambda x: x[0])
-        cand = cand[: self.beam_width]
-        if self.debug:
-            print(f"{'  ' * depth}[search] candidates={len(cand)} kept={len(cand)}")
-
-        best_score = best_so_far
-        best_seq: list[tuple[Point, Point]] = []
-
-        # Recursively evaluate each candidate
-        for cut_err, (from_p, to_p), (P, Q), (a, b) in cand:
-            if cut_err >= best_score:
-                continue
-
-            # Prune extreme imbalance
-            tP = a * self.target_area
-            tQ = b * self.target_area
-            if (
-                abs(P.area - tP) > 10 * self.area_tol
-                and abs(Q.area - tQ) > 10 * self.area_tol
-            ):
-                continue
-
-            cakeP = self._wrap_subcake(cake, P)
-            cakeQ = self._wrap_subcake(cake, Q)
-
-            scoreP, seqP = self._search(cakeP, a, best_score - cut_err, depth + 1)
-            if cut_err + scoreP >= best_score:
-                continue
-
-            scoreQ, seqQ = self._search(
-                cakeQ, b, best_score - cut_err - scoreP, depth + 1
-            )
-            total = cut_err + scoreP + scoreQ
-
-            if total < best_score:
-                best_score = total
-                best_seq = [(from_p, to_p)] + seqP + seqQ
-                if self.debug:
-                    print(
-                        f"{'  ' * depth}[search] new best={best_score:.3f} cuts={len(best_seq)}"
-                    )
-
-        return best_score, best_seq
-
-    # ---------- greedy fill helpers ----------
-    def _best_greedy_cut_for(
-        self, cake: Cake, remaining_children: int
-    ) -> Optional[tuple[Point, Point]]:
-        """
-        Find the best greedy cut for the largest piece to match the target area.
-
-        Args:
-            cake (Cake): The current cake state.
-            remaining_children (int): Number of remaining children.
-
-        Returns:
-            Optional[tuple[Point, Point]]: The best cut or None if no valid cut is found.
-        """
-        # Pick the largest piece to split
-        target_piece = max(cake.get_pieces(), key=lambda p: p.area)
-        m = remaining_children
-        a = m // 2
-        b = m - a
-        tP = a * self.target_area
-        tQ = b * self.target_area
-
-        best = None
+        best_cut: Optional[Tuple[Point, Point]] = None
         best_err = inf
+        best_score = inf
 
-        # Evaluate all candidate cuts
-        pts = self._candidate_points(target_piece)
+        # Loop anchors
+        for ia in range(self.ANCHOR_SAMPLES):
+            if time.time() > deadline:
+                break
+
+            ta = ia / self.ANCHOR_SAMPLES
+            A = pt(ta)
+
+            # coarse sweep; keep top-K candidates for refinement
+            candidates: List[
+                Tuple[float, float, float]
+            ] = []  # (primary_err, tb, score)
+
+            for jb in range(self.SWEEP_SAMPLES):
+                if time.time() > deadline:
+                    break
+
+                tb = jb / self.SWEEP_SAMPLES
+                sep = min((tb - ta) % 1.0, (ta - tb) % 1.0)
+                if sep < min_sep:
+                    continue
+
+                B = pt(tb)
+                if not self._cut_valid_for_piece(cake, piece, A, B):
+                    continue
+
+                primary, score = self._target_err_for_cut(cake, piece, A, B, target)
+                if primary < self.strict_tol:
+                    # perfect enough — return immediately
+                    return (A, B)
+
+                # keep a small candidate set to refine
+                if len(candidates) < self.TOP_SWEEPS_PER_ANCHOR:
+                    candidates.append((primary, tb, score))
+                    candidates.sort(key=lambda x: (x[0], x[2]))
+                else:
+                    # replace worst if better
+                    if (primary, score) < (candidates[-1][0], candidates[-1][2]):
+                        candidates[-1] = (primary, tb, score)
+                        candidates.sort(key=lambda x: (x[0], x[2]))
+
+            # refine each candidate locally
+            for primary, tb0, _ in candidates:
+                if time.time() > deadline:
+                    break
+
+                tb_best = tb0
+                err_best = primary
+                score_best = inf
+                # local bracket around tb0
+                half_window = 1.0 / max(24.0, float(self.SWEEP_SAMPLES))
+                left = (tb_best - half_window) % 1.0
+                right = (tb_best + half_window) % 1.0
+
+                for _ in range(self.REFINE_ITERS):
+                    if time.time() > deadline:
+                        break
+
+                    # sample a grid between left..right (wrap-aware)
+                    grid = self._linspace_wrap(left, right, self.REFINE_GRID)
+                    improved = False
+                    for tb in grid:
+                        sep = min((tb - ta) % 1.0, (ta - tb) % 1.0)
+                        if sep < min_sep:
+                            continue
+                        B = pt(tb)
+                        if not self._cut_valid_for_piece(cake, piece, A, B):
+                            continue
+                        e, s = self._target_err_for_cut(cake, piece, A, B, target)
+                        if e < err_best or (
+                            abs(e - err_best) <= 1e-12 and s < score_best
+                        ):
+                            err_best = e
+                            score_best = s
+                            tb_best = tb
+                            improved = True
+                            if err_best < self.strict_tol:
+                                return (A, pt(tb_best))
+
+                    # shrink the bracket around the best tb
+                    half_window *= self.REFINE_SHRINK
+                    left = (tb_best - half_window) % 1.0
+                    right = (tb_best + half_window) % 1.0
+                    if not improved:
+                        break
+
+                # track global best
+                if err_best < best_err or (
+                    abs(err_best - best_err) <= 1e-12 and score_best < best_score
+                ):
+                    best_err = err_best
+                    best_score = score_best
+                    best_cut = (A, pt(tb_best))
+
+        return best_cut
+
+    # -------------------- scoring & validity --------------------
+    def _target_err_for_cut(
+        self, cake: Cake, piece: Polygon, A: Point, B: Point, target: float
+    ) -> Tuple[float, float]:
+        """
+        Returns:
+          primary = |area(chosen_side) - target|
+          score   = primary + 0.1 * |ratio(chosen_side) - target_ratio|
+        The chosen side is whichever piece is closer to the target area.
+        """
+        split = cake.cut_piece(piece, A, B)
+        if len(split) != 2:
+            return (inf, inf)
+        P, Q = split
+        side = P if abs(P.area - target) <= abs(Q.area - target) else Q
+        primary = abs(side.area - target)
+        ratio = self._piece_ratio(cake, side)
+        score = primary + 0.1 * abs(ratio - self.target_ratio)
+        return (primary, score)
+
+    def _cut_valid_for_piece(
+        self, cake: Cake, piece: Polygon, A: Point, B: Point
+    ) -> bool:
+        ok, _ = cake.cut_is_valid(A, B)
+        if not ok:
+            return False
+        # ensure A and B lie on THIS piece's boundary
+        return cake.point_lies_on_piece_boundary(
+            A, piece
+        ) and cake.point_lies_on_piece_boundary(B, piece)
+
+    # -------------------- fallbacks --------------------
+    def _best_equal_area_or_any(self, cake: Cake) -> Optional[Tuple[Point, Point]]:
+        """Try best equal-area on the largest piece; else any valid cut anywhere."""
+        largest = self._largest_piece(cake)
+        cut = self._best_equal_area_on_piece(cake, largest)
+        if cut is not None:
+            return cut
+        return self._any_valid_cut_anywhere(cake)
+
+    def _best_equal_area_on_piece(
+        self, cake: Cake, piece: Polygon
+    ) -> Optional[Tuple[Point, Point]]:
+        pts = self._candidate_points(piece)
+        best = None
+        best_score = inf
+        half = piece.area / 2.0
         for i in range(len(pts)):
             for j in range(i + 1, len(pts)):
-                pA, pB = pts[i], pts[j]
-                ok, _ = cake.cut_is_valid(pA, pB)
+                a, b = pts[i], pts[j]
+                ok, _ = cake.cut_is_valid(a, b)
                 if not ok:
                     continue
-                split = cake.cut_piece(target_piece, pA, pB)
+                split = cake.cut_piece(piece, a, b)
                 if len(split) != 2:
                     continue
-                P, Q = split
-                err = (P.area - tP) ** 2 + (Q.area - tQ) ** 2
-                if err < best_err:
-                    best_err = err
-                    best = (pA, pB)
+                p, q = split
+                area_err = abs(p.area - half) + abs(q.area - half)
+                r_err = 0.5 * (
+                    abs(self._piece_ratio(cake, p) - self.target_ratio)
+                    + abs(self._piece_ratio(cake, q) - self.target_ratio)
+                )
+                score = area_err + 0.1 * r_err
+                if score < best_score:
+                    best_score = score
+                    best = (a, b)
         return best
 
-    def _fill_with_any_valid(self, cake: Cake, cuts: list[tuple[Point, Point]]) -> bool:
-        """
-        Add any valid cuts to the largest piece until the required number of cuts is reached.
+    def _any_valid_cut_on_piece(
+        self, cake: Cake, piece: Polygon
+    ) -> Optional[Tuple[Point, Point]]:
+        pts = self._candidate_points(piece)
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                a, b = pts[i], pts[j]
+                ok, _ = cake.cut_is_valid(a, b)
+                if ok:
+                    return (a, b)
+        return None
 
-        Args:
-            cake (Cake): The current cake state.
-            cuts (list[tuple[Point, Point]]): Current list of cuts.
+    def _any_valid_cut_anywhere(self, cake: Cake) -> Optional[Tuple[Point, Point]]:
+        for piece in cake.get_pieces():
+            cut = self._any_valid_cut_on_piece(cake, piece)
+            if cut:
+                return cut
+        return None
 
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        while len(cuts) < self.children - 1:
-            target_piece = max(cake.get_pieces(), key=lambda p: p.area)
-            pts = self._candidate_points(target_piece)
-            found = False
-            for i in range(len(pts)):
-                for j in range(i + 1, len(pts)):
-                    a, b = pts[i], pts[j]
-                    ok, _ = cake.cut_is_valid(a, b)
-                    if not ok:
-                        continue
-                    cuts.append((a, b))
-                    cake.cut(a, b)
-                    found = True
-                    break
-                if found:
-                    break
-            if not found:
-                return False
-        return True
+    # -------------------- geometry helpers --------------------
+    def _largest_piece(self, cake: Cake) -> Polygon:
+        return max(cake.get_pieces(), key=lambda p: p.area)
 
-    # ---------- scoring / geometry ----------
-    def _leaf_score(self, cake: Cake) -> float:
-        """
-        Calculate the score for a leaf node (single piece).
+    def _piece_ratio(self, cake: Cake, poly: Polygon) -> float:
+        if poly.is_empty or poly.area <= 0:
+            return 0.0
+        return cake.get_piece_ratio(poly)
 
-        Args:
-            cake (Cake): The current cake state.
-
-        Returns:
-            float: The score for the leaf node.
-        """
-        piece = cake.get_pieces()[0]
-        area = piece.area
-        ratio = self._ratio_v_parent(cake, piece)
-        area_err = (area - self.target_area) ** 2
-        ratio_err = (ratio - self.avg_ratio) ** 2
-        return area_err + 0.1 * ratio_err
-
-    def _candidate_points(self, poly: Polygon) -> list[Point]:
-        """
-        Generate candidate points for cuts (vertices and edge midpoints).
-
-        Args:
-            poly (Polygon): The polygon to generate points for.
-
-        Returns:
-            list[Point]: list of candidate points.
-        """
+    def _candidate_points(self, poly: Polygon) -> List[Point]:
+        """Vertices + all edge midpoints (including closing edge) for fallback paths."""
         verts = list(poly.exterior.coords[:-1])
         pts = [Point(v) for v in verts]
         n = len(verts)
@@ -331,36 +357,24 @@ class Player2(Player):
             pts.append(Point((x1 + x2) / 2.0, (y1 + y2) / 2.0))
         return pts
 
-    def _wrap_subcake(self, parent: Cake, poly: Polygon) -> Cake:
+    def _linspace_wrap(self, left: float, right: float, m: int) -> List[float]:
         """
-        Create a lightweight sub-cake for recursive processing.
-
-        Args:
-            parent (Cake): The parent cake.
-            poly (Polygon): The polygon representing the sub-cake.
-
-        Returns:
-            Cake: The sub-cake object.
+        Sample m points from [left, right] on a unit circle parameter, handling wrap-around.
         """
-        new = object.__new__(Cake)
-        new.exterior_shape = poly
-        new.interior_shape = parent.interior_shape
-        new.exterior_pieces = [poly]
-        new.sandbox = True
-        return new
-
-    def _ratio_v_parent(self, parent: Cake, poly: Polygon) -> float:
-        """
-        Calculate the interior ratio of a polygon relative to its parent.
-
-        Args:
-            parent (Cake): The parent cake.
-            poly (Polygon): The polygon to calculate the ratio for.
-
-        Returns:
-            float: The interior ratio.
-        """
-        if poly.is_empty or poly.area <= 0:
-            return 0.0
-        inter = poly.intersection(parent.interior_shape)
-        return 0.0 if inter.is_empty else inter.area / poly.area
+        if m <= 1:
+            return [left]
+        vals: List[float] = []
+        if left <= right:
+            step = (right - left) / (m - 1)
+            for k in range(m):
+                vals.append(left + k * step)
+        else:
+            # wrapped interval
+            total = (1.0 - left) + right
+            step = total / (m - 1)
+            acc = 0.0
+            for _ in range(m):
+                t = (left + acc) % 1.0
+                vals.append(t)
+                acc += step
+        return vals
