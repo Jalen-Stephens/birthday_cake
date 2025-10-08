@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import List, Tuple, Optional
 from math import inf
-import time
 
 from shapely import Point, Polygon
 from players.player import Player, PlayerException
@@ -64,16 +63,10 @@ class Player2(Player):
         # Validity guard for near-adjacent endpoints (normalized by boundary length)
         self.MIN_SEP_FRAC = 1.0 / 600.0
 
-        # Time budget (wall clock) to approximate CPU minute
-        self.TIME_BUDGET_SEC = 55.0
-
     # -------------------- public entry --------------------
     def get_cuts(self) -> List[Tuple[Point, Point]]:
         if self.children <= 1:
             return []
-
-        start_time = time.time()
-        deadline = start_time + self.TIME_BUDGET_SEC
 
         work = self.cake.copy()
         cuts: List[Tuple[Point, Point]] = []
@@ -81,9 +74,7 @@ class Player2(Player):
         # Odd: first 1/n peel from the whole cake
         if self.children % 2 == 1:
             whole = self._largest_piece(work)
-            first = self._target_search(
-                work, whole, frac=1.0 / self.children, deadline=deadline
-            )
+            first = self._target_search(work, whole, frac=1.0 / self.children)
             if first is None:
                 # fallback: any valid cut to proceed
                 first = self._any_valid_cut_on_piece(work, whole)
@@ -94,17 +85,15 @@ class Player2(Player):
 
         # Continue peeling target shares until n pieces exist
         while len(work.get_pieces()) < self.children:
-            if time.time() > deadline:
-                # Time nearly up: be pragmatic
+            largest = self._largest_piece(work)
+            cut = self._target_search(
+                work, largest, frac=None
+            )  # None => absolute target
+
+            # Fallbacks if strict search fails
+            if cut is None:
+                # fallback if strict search fails
                 cut = self._best_equal_area_or_any(work)
-            else:
-                largest = self._largest_piece(work)
-                cut = self._target_search(
-                    work, largest, frac=None, deadline=deadline
-                )  # None => absolute target
-                if cut is None:
-                    # fallback if strict search fails
-                    cut = self._best_equal_area_or_any(work)
 
             if cut is None:
                 raise PlayerException(
@@ -127,7 +116,6 @@ class Player2(Player):
         cake: Cake,
         piece: Polygon,
         frac: Optional[float],
-        deadline: float,
     ) -> Optional[Tuple[Point, Point]]:
         """
         Search a boundary-to-boundary chord to peel a target-sized area from `piece`.
@@ -156,9 +144,6 @@ class Player2(Player):
 
         # Loop anchors
         for ia in range(self.ANCHOR_SAMPLES):
-            if time.time() > deadline:
-                break
-
             ta = ia / self.ANCHOR_SAMPLES
             A = pt(ta)
 
@@ -168,9 +153,6 @@ class Player2(Player):
             ] = []  # (primary_err, tb, score)
 
             for jb in range(self.SWEEP_SAMPLES):
-                if time.time() > deadline:
-                    break
-
                 tb = jb / self.SWEEP_SAMPLES
                 sep = min((tb - ta) % 1.0, (ta - tb) % 1.0)
                 if sep < min_sep:
@@ -197,9 +179,6 @@ class Player2(Player):
 
             # refine each candidate locally
             for primary, tb0, _ in candidates:
-                if time.time() > deadline:
-                    break
-
                 tb_best = tb0
                 err_best = primary
                 score_best = inf
@@ -209,9 +188,6 @@ class Player2(Player):
                 right = (tb_best + half_window) % 1.0
 
                 for _ in range(self.REFINE_ITERS):
-                    if time.time() > deadline:
-                        break
-
                     # sample a grid between left..right (wrap-aware)
                     grid = self._linspace_wrap(left, right, self.REFINE_GRID)
                     improved = False
