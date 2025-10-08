@@ -9,3 +9,6 @@ wheels/
 
 # Virtual environments
 .venv
+venv
+
+players/player8/koch_snowflake.py
