@@ -1,299 +1,379 @@
+# players/player2.py
 from __future__ import annotations
-from shapely import Point, Polygon, LineString
-from shapely.geometry import MultiPolygon
-from typing import List, Tuple
-from players.player import Player
-from src.cake import Cake
+from typing import List, Tuple, Optional
+from math import inf
+from shapely import Point
+from shapely.geometry import LineString, Polygon
+
+from players.player import Player, PlayerException
 import src.constants as c
+from src.cake import Cake, extend_line
 
 
 class Player2(Player):
     """
-    Area-Targeted Cutting Strategy:
-    - Calculates exact target piece sizes
-    - Samples boundary points to find cuts that produce correct-sized pieces
-    - Prioritizes area accuracy over crust ratio
+    divide-&-Conquer (beam) planner + robust sequential
+
+    plan phase (on subcakes):
+      - recursively split target piece counts (prefer near-halves)
+      - evaluate chords built from rich boundary candidates
+      - keep top-K (beam) by squared error vs. target areas
+      - return an ordered list of cuts (root cut, then cuts for each subpiece)
+
+    phase (on a working copy of the real cake):
+      - apply cuts in that order
+      - for each planned pair, SNAP both endpoints to the boundary of the
+        actual piece it should cut (try all pieces, choose the first that yields a
+        valid split under simulator rules)
+      - if a planned cut can't be realized, use a greedy best cut on the
+        largest current piece; if that fails, use any-valid fallback.
+
+    Focus: equal areas. (Crust ratio only lightly penalized in scoring;
+    you can dial that in later.)
     """
+
+    # ------------------ init ------------------
 
     def __init__(self, children: int, cake: Cake, cake_path: str | None) -> None:
         super().__init__(children, cake, cake_path)
-        self.target_piece_area = self.cake.exterior_shape.area / self.children
-        self.target_ratio = self.cake.get_piece_ratio(self.cake.get_pieces()[0])
+
+        base_poly = self.cake.get_pieces()[0]
+        self.total_area = base_poly.area
+        self.target_area = self.total_area / max(1, self.children)
+        self.avg_ratio = self.cake.interior_shape.area / max(self.total_area, 1e-9)
+
+        self.beam_width = 5  # widen for better search, narrow for speed
+        self.sample_count = 64  # boundary samples per piece (in addition to vertices)
+        self.area_tol = getattr(c, "PIECE_SPAN_TOL", 0.5)  # cm^2
+        self.ratio_w = 0.10  # small weight on ratio to break ties (can set 0)
+
+    # ------------------ public ------------------
 
     def get_cuts(self) -> List[Tuple[Point, Point]]:
-        """
-        Generate cuts targeting specific piece sizes.
-        """
-        moves = []
-        
-        # Build list of target cumulative areas for pieces we want to cut off
-        total_area = self.cake.exterior_shape.area
-        area_targets = []
-        for i in range(1, self.children):
-            area_targets.append(self.target_piece_area * i)
-        
-        for cut_num in range(self.children - 1):
-            print(f"Cut {cut_num + 1}/{self.children - 1}")
-            
-            # Get largest piece
-            piece = max(self.cake.get_pieces(), key=lambda p: p.area)
-            
-            # Determine what size piece we should cut off
-            # Always aim for exactly target_piece_area
-            target_cut_area = self.target_piece_area
-            
-            print(f"  Piece area: {piece.area:.2f}, Target cut: {target_cut_area:.2f}, Target piece: {self.target_piece_area:.2f}")
-            
-            # Find cut that produces this target area
-            cut = self._find_target_area_cut(piece, target_cut_area, area_targets)
-            
-            if cut is None:
-                print(f"Warning: Failed to find cut at iteration {cut_num}")
+        if self.children <= 1:
+            return []
+
+        # on a sandbox copy (subcakes)
+        plan_cake = self.cake.copy()
+        root_piece = plan_cake.get_pieces()[0]
+        _, planned = self._search(
+            self._wrap_subcake(plan_cake, root_piece),
+            pieces_needed=self.children,
+            best_so_far=inf,
+            depth=0,
+        )
+
+        # planned list sequentially on a fresh working cake,
+        # snapping each cut to the current geometry
+        realized = self._realize_sequential(self.cake.copy(), planned)
+
+        # if we didn't get enough, greedily add equal-area cuts
+        while len(realized) < self.children - 1:
+            add = self._best_greedy_cut_for(self.cake.copy(), realized)
+            if add is None:
                 break
-            
-            p1, p2 = cut
-            moves.append((p1, p2))
-            
+            realized.append(add)
+
+        # if still short, fill with any valid cuts
+        if len(realized) != self.children - 1:
+            if not self._fill_with_any_valid(self.cake.copy(), realized):
+                raise PlayerException(
+                    f"Player2: could not assemble {self.children - 1} cuts (got {len(realized)})."
+                )
+
+        return realized
+
+    # ------------------ search (plan) ------------------
+
+    def _search(
+        self,
+        cake: Cake,  # sandbox subcake with a single piece
+        pieces_needed: int,
+        best_so_far: float,
+        depth: int,
+    ) -> tuple[float, List[Tuple[Point, Point]]]:
+        piece = cake.get_pieces()[0]
+        if pieces_needed == 1:
+            return self._leaf_score(cake), []
+
+        m = pieces_needed
+        preferred = [(m // 2, m - (m // 2))]
+        neighbors: list[tuple[int, int]] = []
+        if m > 2:
+            a0 = preferred[0][0]
+            neighbors.append((max(1, a0 - 1), m - max(1, a0 - 1)))
+            neighbors.append((min(m - 1, a0 + 1), m - min(m - 1, a0 + 1)))
+
+        splits: list[tuple[int, int]] = []
+        seen = set()
+        for a, b in preferred + neighbors:
+            if a <= 0 or b <= 0:
+                continue
+            key = (min(a, b), max(a, b))
+            if key not in seen:
+                splits.append((a, b))
+                seen.add(key)
+
+        # rich candidate endpoints on THIS piece boundary
+        cand_pts = self._candidate_points(piece)
+
+        cand: list[
+            tuple[float, Tuple[Point, Point], Tuple[Polygon, Polygon], Tuple[int, int]]
+        ] = []
+
+        for i in range(len(cand_pts)):
+            for j in range(i + 1, len(cand_pts)):
+                pA, pB = cand_pts[i], cand_pts[j]
+                ok, _ = cake.cut_is_valid(pA, pB)
+                if not ok:
+                    continue
+                parts = cake.cut_piece(piece, pA, pB)
+                if len(parts) != 2:
+                    continue
+                P, Q = parts
+                aP, aQ = P.area, Q.area
+
+                # score each desired split (a,b)
+                for a, b in splits:
+                    tP = a * self.target_area
+                    tQ = b * self.target_area
+                    err = (aP - tP) ** 2 + (aQ - tQ) ** 2
+                    if self.ratio_w > 0:
+                        rP = self._ratio_v_parent(cake, P)
+                        rQ = self._ratio_v_parent(cake, Q)
+                        err += self.ratio_w * (
+                            (rP - self.avg_ratio) ** 2 + (rQ - self.avg_ratio) ** 2
+                        )
+                    cand.append((err, (pA, pB), (P, Q), (a, b)))
+
+        if not cand:
+            return inf, []
+
+        cand.sort(key=lambda x: x[0])
+        cand = cand[: self.beam_width]
+
+        best_score = best_so_far
+        best_seq: List[Tuple[Point, Point]] = []
+
+        for cut_err, (from_p, to_p), (P, Q), (a, b) in cand:
+            if cut_err >= best_score:
+                continue
+
+            # prune very poor fits
+            tP = a * self.target_area
+            tQ = b * self.target_area
+            if (
+                abs(P.area - tP) > 10 * self.area_tol
+                and abs(Q.area - tQ) > 10 * self.area_tol
+            ):
+                continue
+
+            cakeP = self._wrap_subcake(cake, P)
+            cakeQ = self._wrap_subcake(cake, Q)
+
+            sP, seqP = self._search(cakeP, a, best_score - cut_err, depth + 1)
+            if cut_err + sP >= best_score:
+                continue
+
+            sQ, seqQ = self._search(cakeQ, b, best_score - cut_err - sP, depth + 1)
+            total = cut_err + sP + sQ
+
+            if total < best_score:
+                best_score = total
+                best_seq = [(from_p, to_p)] + seqP + seqQ
+
+        return best_score, best_seq
+
+    # ------------------ realization (snap & apply) ------------------
+
+    def _realize_sequential(
+        self, sim: Cake, planned: List[Tuple[Point, Point]]
+    ) -> List[Tuple[Point, Point]]:
+        realized: List[Tuple[Point, Point]] = []
+
+        for p_raw, q_raw in planned:
+            snapped = self._snap_to_some_piece(sim, p_raw, q_raw)
+            if snapped is None:
+                # planned cut can’t be realized on current geometry; try greedy instead
+                g = self._best_greedy_cut_for(sim, realized)
+                if g is None:
+                    # try any valid
+                    g = self._any_valid_on(sim)
+                if g is None:
+                    # give up on this slot; continue (fill later)
+                    continue
+                p_use, q_use = g
+            else:
+                p_use, q_use = snapped
+
+            realized.append((p_use, q_use))
             try:
-                self.cake.cut(p1, p2)
-            except Exception as e:
-                print(f"Error applying cut {cut_num}: {e}")
-                break
-        
-        return moves
+                sim.cut(p_use, q_use)
+            except Exception:
+                # if simulator still rejects, skip but keep count
+                pass
 
-    def _find_target_area_cut(
-        self, 
-        piece: Polygon, 
-        target_area: float,
-        area_targets: List[float]
-    ) -> Tuple[Point, Point] | None:
-        """
-        Find a cut that produces a piece close to target_area.
-        """
-        piece_boundary = piece.boundary
-        boundary_length = piece_boundary.length
-        
-        if boundary_length < 2.0:
-            return None
-        
-        # Sample points along boundary
-        # Use aggressive sampling for best accuracy
-        num_candidates = min(250, max(80, int(boundary_length / 0.6)))
-        step_size = boundary_length / num_candidates
-        candidates = [
-            piece_boundary.interpolate(i * step_size) 
-            for i in range(num_candidates)
-        ]
-        
-        best_cut = None
-        best_score = float('inf')
-        excellent_cuts = []  # Store cuts with very good area accuracy
-        
-        # Try pairs of boundary points - exhaustive for small pieces
-        sample_step = max(1, num_candidates // 70)  # Very dense sampling
-        
-        for i in range(0, num_candidates, sample_step):
-            for j in range(i + 3, num_candidates, sample_step):
-                p1 = candidates[i]
-                p2 = candidates[j]
-                
-                # Quick checks
-                if p1.distance(p2) < 0.5:
-                    continue
-                
-                # Validate cut
-                cut_line = LineString([p1, p2])
-                good, _ = self.cake.does_line_cut_piece_well(cut_line, piece)
-                
-                if not good:
-                    continue
-                
-                valid, _ = self.cake.cut_is_valid(p1, p2)
-                if not valid:
-                    continue
-                
-                # Score this cut
-                area_error, crust_error = self._score_cut(
-                    p1, p2, piece, target_area, area_targets
-                )
-                
-                if area_error == float('inf'):
-                    continue
-                
-                # Combined score - prioritize area accuracy more
-                # Area within 0.5cm² is critical per spec
-                score = area_error * 40.0 + crust_error * 8.0
-                
-                # Track excellent cuts (within 3% of target area - tighter threshold)
-                if area_error < 0.03:
-                    excellent_cuts.append((area_error, crust_error, p1, p2))
-                
-                if score < best_score:
-                    best_score = score
-                    best_cut = (p1, p2)
-        
-        # If we have cuts with excellent area accuracy, pick best crust ratio among them
-        if len(excellent_cuts) > 3:
-            print(f"  Found {len(excellent_cuts)} excellent cuts")
-            
-            # First, filter to only the very best area cuts (within 1.5% if possible)
-            very_best_area = [cut for cut in excellent_cuts if cut[0] < 0.015]
-            
-            if len(very_best_area) > 2:
-                # Among the very best area cuts, pick best crust
-                very_best_area.sort(key=lambda x: x[1])
-                _, crust_err, p1, p2 = very_best_area[0]
-                print(f"    Best area+crust: crust_err={crust_err:.4f}")
-                return (p1, p2)
-            else:
-                # Otherwise just optimize crust among all excellent cuts
-                excellent_cuts.sort(key=lambda x: x[1])
-                _, crust_err, p1, p2 = excellent_cuts[0]
-                print(f"    Best crust error: {crust_err:.4f}")
-                return (p1, p2)
-        
-        # Even if we don't have many "excellent" cuts, if we have some good ones
-        # prioritize crust ratio
-        if len(excellent_cuts) > 0:
-            print(f"  Found {len(excellent_cuts)} good cuts, optimizing crust")
-            excellent_cuts.sort(key=lambda x: x[1])
-            _, crust_err, p1, p2 = excellent_cuts[0]
-            print(f"    Crust error: {crust_err:.4f}")
-            return (p1, p2)
-        
-        if best_cut and best_score < float('inf'):
-            # Show how good the cut is
-            area_component = best_score / 30.0  # Approximate area component
-            print(f"  Best cut score: {best_score:.2f}")
-            return best_cut
-        
-        # Fallback: if no cut found, try less strict approach
-        print(f"  Using fallback strategy")
-        return self._find_any_reasonable_cut(piece, target_area)
+        return realized
 
-    def _score_cut(
-        self, 
-        p1: Point, 
-        p2: Point, 
-        piece: Polygon,
-        target_area: float,
-        area_targets: List[float]
-    ) -> Tuple[float, float]:
+    def _snap_to_some_piece(
+        self, sim: Cake, p: Point, q: Point
+    ) -> Optional[Tuple[Point, Point]]:
         """
-        Score cut based on area accuracy and crust ratio.
-        Returns (area_error, crust_error) where lower is better.
+        Try every current piece: project p and q to that piece boundary.
+        If extend_line(boundary-snapped segment) validly splits the piece into two
+        >= MIN_PIECE_AREA polygons, return snapped endpoints.
         """
-        try:
-            split_pieces = self.cake.cut_piece(piece, p1, p2)
-            
-            if len(split_pieces) != 2:
-                return float('inf'), float('inf')
-            
-            piece_a, piece_b = split_pieces
-            
-            # We want to cut off a piece close to target_area
-            # The smaller piece is what we're "cutting off"
-            smaller_piece = piece_a if piece_a.area < piece_b.area else piece_b
-            larger_piece = piece_b if piece_a.area < piece_b.area else piece_a
-            
-            # Calculate area error as percentage of target
-            area_diff = abs(smaller_piece.area - target_area)
-            area_error = area_diff / self.target_piece_area
-            
-            # Also check if it matches any of our cumulative targets well
-            if area_targets:
-                min_target_error = min(
-                    abs(smaller_piece.area - t) / self.target_piece_area 
-                    for t in area_targets
-                )
-                area_error = min(area_error, min_target_error)
-            
-            # Crust ratio score - both pieces should be close to target
-            ratio_a = self.cake.get_piece_ratio(piece_a)
-            ratio_b = self.cake.get_piece_ratio(piece_b)
-            
-            # Calculate deviation from target for each piece
-            deviation_a = abs(ratio_a - self.target_ratio)
-            deviation_b = abs(ratio_b - self.target_ratio)
-            
-            # Total crust error - want both pieces to match target
-            crust_error = deviation_a + deviation_b
-            
-            return area_error, crust_error
-            
-        except Exception:
-            return float('inf'), float('inf')
+        for piece in sim.get_pieces():
+            bound = piece.boundary
+            a = bound.interpolate(bound.project(p))
+            b = bound.interpolate(bound.project(q))
 
-    def _calculate_crust_proportion(self, poly: Polygon) -> float:
-        """
-        Calculate the proportion of the polygon that is 'crust'.
-        """
-        try:
-            interior = poly.buffer(-c.CRUST_SIZE)
-            
-            if isinstance(interior, MultiPolygon):
-                interior_area = sum(p.area for p in interior.geoms if isinstance(p, Polygon))
-            elif isinstance(interior, Polygon):
-                interior_area = max(0.0, interior.area)
-            else:
-                interior_area = 0.0
-            
-            crust_area = max(0.0, poly.area - interior_area)
-            
-            if poly.area > 0:
-                return min(1.0, crust_area / poly.area)
-            return 1.0
-        except Exception:
-            return 0.5
+            # Build the extended line and test piece-level split predicate
+            line = extend_line(LineString([a, b]))
+            good, _ = sim.does_line_cut_piece_well(line, piece)
+            if not good:
+                continue
 
-    def _find_any_reasonable_cut(self, piece: Polygon, target_area: float) -> Tuple[Point, Point] | None:
+            # Also make sure global validity passes (single-piece, within cake)
+            ok, _ = sim.cut_is_valid(a, b)
+            if not ok:
+                continue
+
+            return a, b
+        return None
+
+    # ------------------ greedy & fallbacks ------------------
+
+    def _best_greedy_cut_for(
+        self, original: Cake, already_realized: List[Tuple[Point, Point]]
+    ) -> Optional[Tuple[Point, Point]]:
         """
-        Fallback: find any cut that's reasonably close to target area.
-        Less strict validation, more aggressive sampling.
+        Given a fresh copy of the original cake and the cuts already realized,
+        simulate those cuts to reproduce current geometry, then find the best
+        approximate equal-area cut on the largest current piece.
         """
-        boundary = list(piece.exterior.coords)[:-1]
-        n = len(boundary)
-        
-        if n < 3:
-            return None
-        
-        best_cut = None
-        best_area_diff = float('inf')
-        
-        # Try many boundary point pairs
-        step = max(1, n // 40)
-        
-        for i in range(0, n, step):
-            for j in range(i + 2, n, step):
-                p1 = Point(boundary[i])
-                p2 = Point(boundary[j])
-                
-                if p1.distance(p2) < 0.3:
+        sim = original.copy()
+        # replay already_realized to mirror current state
+        for a, b in already_realized:
+            try:
+                sim.cut(a, b)
+            except Exception:
+                # Try one snap pass if it fails
+                snapped = self._snap_to_some_piece(sim, a, b)
+                if snapped is None:
+                    return None
+                sim.cut(snapped[0], snapped[1])
+
+        target_piece = max(sim.get_pieces(), key=lambda p: p.area)
+        # We aim to split remaining children roughly in half
+        # Determine remaining children from area ratio
+        remaining_area = sum(p.area for p in sim.get_pieces())
+        remaining_children = max(2, round(remaining_area / self.target_area))
+        a = remaining_children // 2
+        b = remaining_children - a
+        tP = a * self.target_area
+        tQ = b * self.target_area
+
+        best = None
+        best_err = inf
+
+        pts = self._candidate_points(target_piece)
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                pA, pB = pts[i], pts[j]
+                ok, _ = sim.cut_is_valid(pA, pB)
+                if not ok:
                     continue
-                
-                # Check validity
-                try:
-                    valid, _ = self.cake.cut_is_valid(p1, p2)
-                    if not valid:
-                        continue
-                    
-                    cut_line = LineString([p1, p2])
-                    good, _ = self.cake.does_line_cut_piece_well(cut_line, piece)
-                    
-                    if not good:
-                        continue
-                    
-                    # Check area
-                    split_pieces = self.cake.cut_piece(piece, p1, p2)
-                    if len(split_pieces) == 2:
-                        smaller = min(split_pieces[0].area, split_pieces[1].area)
-                        area_diff = abs(smaller - target_area)
-                        
-                        if area_diff < best_area_diff:
-                            best_area_diff = area_diff
-                            best_cut = (p1, p2)
-                except Exception:
+                parts = sim.cut_piece(target_piece, pA, pB)
+                if len(parts) != 2:
                     continue
-        
-        return best_cut
+                P, Q = parts
+                err = (P.area - tP) ** 2 + (Q.area - tQ) ** 2
+                if err < best_err:
+                    best_err = err
+                    best = (pA, pB)
+
+        return best
+
+    def _any_valid_on(self, sim: Cake) -> Optional[Tuple[Point, Point]]:
+        """Pick any valid cut on the largest current piece."""
+        piece = max(sim.get_pieces(), key=lambda p: p.area)
+        pts = self._candidate_points(piece)
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                a, b = pts[i], pts[j]
+                ok, _ = sim.cut_is_valid(a, b)
+                if ok:
+                    return a, b
+        return None
+
+    def _fill_with_any_valid(
+        self, original: Cake, cuts: List[Tuple[Point, Point]]
+    ) -> bool:
+        """Keep adding any valid cuts until we reach n-1."""
+        sim = original.copy()
+        for a, b in cuts:
+            try:
+                sim.cut(a, b)
+            except Exception:
+                snapped = self._snap_to_some_piece(sim, a, b)
+                if snapped is None:
+                    continue
+                sim.cut(snapped[0], snapped[1])
+
+        while len(cuts) < self.children - 1:
+            g = self._any_valid_on(sim)
+            if g is None:
+                return False
+            cuts.append(g)
+            try:
+                sim.cut(g[0], g[1])
+            except Exception:
+                # if even this fails, try snap once
+                snapped = self._snap_to_some_piece(sim, g[0], g[1])
+                if snapped is None:
+                    return False
+                sim.cut(snapped[0], snapped[1])
+        return True
+
+    # ------------------ points / scoring / subcakes ------------------
+
+    def _candidate_points(self, poly: Polygon) -> List[Point]:
+        """
+        Vertices + uniform samples along boundary length.
+        This avoids 'corner fan' and provides many chords that truly cross the piece.
+        """
+        pts: List[Point] = [Point(xy) for xy in list(poly.exterior.coords[:-1])]
+        L = poly.boundary.length
+        if L <= c.TOL:
+            return pts
+        step = L / self.sample_count
+        # start at small offset to avoid degeneracy with actual vertices
+        offset = 0.5 * step
+        for k in range(self.sample_count):
+            s = (offset + k * step) % L
+            pts.append(poly.boundary.interpolate(s))
+        return pts
+
+    def _leaf_score(self, cake: Cake) -> float:
+        piece = cake.get_pieces()[0]
+        area_err = (piece.area - self.target_area) ** 2
+        if self.ratio_w <= 0:
+            return area_err
+        ratio = self._ratio_v_parent(cake, piece)
+        ratio_err = (ratio - self.avg_ratio) ** 2
+        return area_err + self.ratio_w * ratio_err
+
+    def _wrap_subcake(self, parent: Cake, poly: Polygon) -> Cake:
+        new = object.__new__(Cake)
+        new.exterior_shape = poly
+        new.interior_shape = parent.interior_shape
+        new.exterior_pieces = [poly]
+        new.sandbox = True
+        return new
+
+    def _ratio_v_parent(self, parent: Cake, poly: Polygon) -> float:
+        if poly.is_empty or poly.area <= 0:
+            return 0.0
+        inter = poly.intersection(parent.interior_shape)
+        return 0.0 if inter.is_empty else inter.area / poly.area
